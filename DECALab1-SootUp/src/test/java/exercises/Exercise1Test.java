@@ -17,9 +17,9 @@ public class Exercise1Test extends TestSetup {
 		reporter = new VulnerabilityReporter();
 		executeMisuseAnalysis(Misuse.class);
 		assertEquals(1, reporter.getReportedVulnerabilities().size());
-    assertEquals(
-        "<target.exercise1.Misuse: void test()> - aesCipher = staticinvoke <javax.crypto.Cipher: javax.crypto.Cipher getInstance(java.lang.String)>(\"AES\")",
-        reporter.getReportedVulnerabilities().get(0));
+		assertEquals(
+			"<target.exercise1.Misuse: void test()> - aesCipher = staticinvoke <javax.crypto.Cipher: javax.crypto.Cipher getInstance(java.lang.String)>(\"AES\")",
+			reporter.getReportedVulnerabilities().get(0));
 	}
 
 	@Test
