@@ -6,7 +6,6 @@ import static org.junit.Assert.assertTrue;
 import analysis.FileStateFact;
 import analysis.VulnerabilityReporter;
 import analysis.exercise2.TypeStateAnalysis;
-frommated
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
