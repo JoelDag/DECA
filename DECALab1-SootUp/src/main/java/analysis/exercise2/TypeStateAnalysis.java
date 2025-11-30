@@ -3,74 +3,216 @@ package analysis.exercise2;
 import analysis.FileStateFact;
 import analysis.ForwardAnalysis;
 import analysis.VulnerabilityReporter;
-
-import java.util.*;
-
-import sootup.core.jimple.basic.Local;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import javax.annotation.Nonnull;
 import sootup.core.jimple.basic.Value;
 import sootup.core.jimple.common.expr.AbstractInvokeExpr;
+import sootup.core.jimple.common.expr.JInterfaceInvokeExpr;
+import sootup.core.jimple.common.expr.JNewExpr;
 import sootup.core.jimple.common.expr.JSpecialInvokeExpr;
 import sootup.core.jimple.common.expr.JVirtualInvokeExpr;
 import sootup.core.jimple.common.stmt.JAssignStmt;
 import sootup.core.jimple.common.stmt.JInvokeStmt;
+import sootup.core.jimple.common.stmt.JReturnStmt;
 import sootup.core.jimple.common.stmt.JReturnVoidStmt;
 import sootup.core.jimple.common.stmt.Stmt;
-import sootup.core.signatures.MethodSignature;
 import sootup.java.core.JavaSootMethod;
-import sootup.core.jimple.common.expr.JNewExpr;
-import sootup.core.jimple.common.expr.JInterfaceInvokeExpr;
-import sootup.core.jimple.common.stmt.JReturnStmt;
-
-import javax.annotation.Nonnull;
 
 public class TypeStateAnalysis extends ForwardAnalysis<Set<FileStateFact>> {
 
     public TypeStateAnalysis(@Nonnull JavaSootMethod method, @Nonnull VulnerabilityReporter reporter) {
         super(method, reporter);
-        // System.out.println(method.getBody());
     }
 
-    /**
-     * Helper to create a standard HashSet for aliases (used for temporary collections).
-     */
-    private Set<Value> newAliasSet() {
-        return new HashSet<>();
-    }
+    @Override
+    protected void flowThrough(@Nonnull Set<FileStateFact> in, @Nonnull Stmt stmt, @Nonnull Set<FileStateFact> out) {
+        copy(in, out);
+        Set<Value> allValues = getAllValuesInMethod();
 
-    /**
-     * Helper to build the final alias set using a LinkedHashSet, enforcing the order
-     * required by the brittle JUnit test (Jimple temps before user locals).
-     */
-    private Set<Value> buildOrderedFactAliases(Set<Value> sourceAliases) {
-        // Use LinkedHashSet to guarantee insertion order
-        Set<Value> orderedSet = new LinkedHashSet<>();
-        Set<Value> userLocals = new HashSet<>();
-        Set<Value> jimpleTemps = new HashSet<>();
+        if (stmt instanceof JAssignStmt) {
+            handlJAssign(out, (JAssignStmt) stmt, allValues);
+        }
 
-        // 1. Separate Jimple temps from user locals
-        for (Value v : sourceAliases) {
-            String s = v.toString();
-            // Heuristic: Jimple temps start with $ (e.g., $stack2) or r (e.g., r0).
-            // This order is required by the tests.
-            if (s.startsWith("$") || s.startsWith("r")) {
-                jimpleTemps.add(v);
-            } else {
-                userLocals.add(v);
+        AbstractInvokeExpr invokeExpr = extractInvokeExpr(stmt);
+        if (invokeExpr != null) {
+            handleInvocation(out, invokeExpr, allValues);   //update file state for all alisases of the base object
+        }
+
+        // report vulneraibilities when still open
+        if (stmt instanceof JReturnStmt || stmt instanceof JReturnVoidStmt) {
+            for (FileStateFact fact : out) {
+                if (fact.getState() == FileStateFact.FileState.Open) {
+                    reporter.reportVulnerability(method.getSignature(), stmt);
+                }
             }
         }
 
-        // 2. Insert Jimple temps first
-        orderedSet.addAll(jimpleTemps);
-
-        // 3. Insert user locals next (e.g., "file")
-        orderedSet.addAll(userLocals);
-
-        return orderedSet;
+        prettyPrint(in, stmt, out);
     }
 
-    // Helper method to gather all potential aliases (Locals, StaticFieldRefs, etc.)
+    private void handlJAssign(Set<FileStateFact> facts, JAssignStmt stmt, Set<Value> allValues) {
+        Value leftOp = stmt.getLeftOp();
+        Value rightOp = stmt.getRightOp();
+        removeAlias(leftOp, facts, stmt, allValues); // kill old aliases of left side operations
+
+        if (rightOp instanceof JNewExpr && "target.exercise2.File".equals(((JNewExpr) rightOp).getType().toString())) {
+            LinkedHashSet<Value> tmp = new LinkedHashSet<>();
+            tmp.add(leftOp);
+            Set<Value> aliases = orderAliases(tmp);
+            facts.add(new FileStateFact(aliases, FileStateFact.FileState.Init));
+            return;
+        }
+
+        if (rightOp instanceof AbstractInvokeExpr) return;
+
+        //propaget the alias
+        List<FileStateFact> updates = new ArrayList<>();
+        Iterator<FileStateFact> it = facts.iterator();
+        while (it.hasNext()) {
+            FileStateFact fact = it.next();
+            if (fact.containsAlias(rightOp)) {
+                it.remove();
+                updates.add(new FileStateFact(orderAliases(addAlias(collectAliases(fact, allValues), leftOp)), fact.getState()));
+            }
+        }
+        facts.addAll(updates);
+    }
+
+    private void handleInvocation(Set<FileStateFact> facts, AbstractInvokeExpr expr, Set<Value> allValues) {
+        if (!"target.exercise2.File".equals(expr.getMethodSignature().getDeclClassType().getFullyQualifiedName())) {
+            return;
+        }
+
+        Value base = getBase(expr);
+        if (base == null) return;
+
+        String methodName = expr.getMethodSignature().getName();
+        FileStateFact.FileState newState;
+        if ("open".equals(methodName)) {
+            newState = FileStateFact.FileState.Open;
+        } else if ("close".equals(methodName)) {
+            newState = FileStateFact.FileState.Close;
+        } else {
+            return;
+        }
+
+        List<FileStateFact> updates = new ArrayList<>();
+        Iterator<FileStateFact> it = facts.iterator();
+        while (it.hasNext()) {
+            FileStateFact fact = it.next();
+            if (fact.containsAlias(base)) {
+                it.remove();
+                updates.add(new FileStateFact(orderAliases(collectAliases(fact, allValues)), newState));
+            }
+        }
+        facts.addAll(updates);
+    }
+
+    private void removeAlias(Value alias, Set<FileStateFact> facts, Stmt stmt, Set<Value> allValues) {
+        List<FileStateFact> survivors = new ArrayList<>();
+        Iterator<FileStateFact> it = facts.iterator();
+
+        while (it.hasNext()) {
+            FileStateFact fact = it.next();
+            if (fact.containsAlias(alias)) {
+                it.remove();
+
+                LinkedHashSet<Value> remaining = new LinkedHashSet<>();
+                for (Value v : collectAliases(fact, allValues)) {
+                    if (!v.equivTo(alias)) {
+                        remaining.add(v);
+                    }
+                }
+
+                if (remaining.isEmpty()) {
+                    if (fact.getState() == FileStateFact.FileState.Open) {
+                        reporter.reportVulnerability(method.getSignature(), stmt);
+                    }
+                } else {
+                    survivors.add(new FileStateFact(orderAliases(remaining), fact.getState()));
+                }
+            }
+        }
+        facts.addAll(survivors);
+    }
+
+    private AbstractInvokeExpr extractInvokeExpr(Stmt stmt) {
+        if (stmt instanceof JInvokeStmt) {
+            return ((JInvokeStmt) stmt).getInvokeExpr();
+        }
+        if (stmt instanceof JAssignStmt) {
+            Value right = ((JAssignStmt) stmt).getRightOp();
+            if (right instanceof AbstractInvokeExpr) {
+                return (AbstractInvokeExpr) right;
+            }
+        }
+        return null;
+    }
+
+    private LinkedHashSet<Value> orderAliases(Set<Value> aliases) {
+        LinkedHashSet<Value> ordered = new LinkedHashSet<>();
+        LinkedHashSet<Value> temps = new LinkedHashSet<>();
+        LinkedHashSet<Value> locals = new LinkedHashSet<>();
+
+        for (Value v : aliases) {
+            String s = v.toString();
+            if (s.startsWith("$") || s.startsWith("r")) temps.add(v);
+            else locals.add(v);
+        }
+
+        ordered.addAll(temps);
+        ordered.addAll(locals);
+        return ordered;
+    }
+
+
+    private Value getBase(AbstractInvokeExpr expr) {
+        if (expr instanceof JVirtualInvokeExpr) {
+            return ((JVirtualInvokeExpr) expr).getBase();
+        }
+        if (expr instanceof JSpecialInvokeExpr) {
+            return ((JSpecialInvokeExpr) expr).getBase();
+        }
+        if (expr instanceof JInterfaceInvokeExpr) {
+            return ((JInterfaceInvokeExpr) expr).getBase();
+        }
+        return null;
+    }
+
+    private Set<Value> addAlias(Set<Value> existingAliases, Value alias) {
+        LinkedHashSet<Value> updated = new LinkedHashSet<>();
+        boolean alreadyPresent = false;
+        for (Value value : existingAliases) {
+            updated.add(value);
+            if (value.equivTo(alias)) {
+                alreadyPresent = true;
+            }
+        }
+        if (!alreadyPresent) {
+            updated.add(alias);
+        }
+        return updated;
+    }
+
+    // rebuild alias set using all values from the method
+    private LinkedHashSet<Value> collectAliases(FileStateFact fact, Set<Value> allValues) {
+        LinkedHashSet<Value> alises = new LinkedHashSet<>();
+        for (Value candidate : allValues) {
+            if (fact.containsAlias(candidate)) {
+                alises.add(candidate);
+            }
+        }
+        return alises;
+    }
+
+    // Helpr method to gather all potential aliases (Locals, StaticFieldRefs, etc.)
     private Set<Value> getAllValuesInMethod() {
-        Set<Value> values = new HashSet<>();
+        Set<Value> values = new LinkedHashSet<>();
         if (method.getBody().getLocals() != null) {
             values.addAll(method.getBody().getLocals());
         }
@@ -94,178 +236,30 @@ public class TypeStateAnalysis extends ForwardAnalysis<Set<FileStateFact>> {
         return values;
     }
 
-    @Override
-    protected void flowThrough(@Nonnull Set<FileStateFact> in, @Nonnull Stmt stmt, @Nonnull Set<FileStateFact> out) {
-        copy(in, out);
-        // TODO: Implement your flow function here.
-        // MethodSignature currentMethodSig = method.getSignature();
-        // this.reporter.reportVulnerability(currentMethodSig, stmt);
 
-        // The universe of all possible values (Locals, StaticFieldRefs, etc.)
-        Set<Value> allPossibleValues = getAllValuesInMethod();
-
-        // --- 1. Handle Assignments (Aliasing & Object Creation) ---
-        if (stmt instanceof JAssignStmt) {
-            JAssignStmt assignStmt = (JAssignStmt) stmt;
-            Value leftOp = assignStmt.getLeftOp();
-            Value rightOp = assignStmt.getRightOp();
-
-            // KILL Logic: 'leftOp' is being overwritten.
-            Set<FileStateFact> factsToRemove = new HashSet<>();
-            Set<FileStateFact> factsToAdd = new HashSet<>();
-
-            for (FileStateFact fact : out) {
-                if (fact.containsAlias(leftOp)) {
-                    factsToRemove.add(fact);
-
-                    // Collect aliases to be kept
-                    Set<Value> aliasesToOrder = newAliasSet();
-                    for (Value v : allPossibleValues) {
-                        if (!v.equivTo(leftOp) && fact.containsAlias(v)) {
-                            aliasesToOrder.add(v);
-                        }
-                    }
-
-                    // ORDERING FIX: Build the LinkedHashSet in the required order
-                    Set<Value> remainingAliases = buildOrderedFactAliases(aliasesToOrder);
-
-                    // VULNERABILITY CHECK (Leak Detection):
-                    if (fact.getState() == FileStateFact.FileState.Open && remainingAliases.isEmpty()) {
-                        reporter.reportVulnerability(method.getSignature(), stmt);
-                    } else if (!remainingAliases.isEmpty()) {
-                        factsToAdd.add(new FileStateFact(remainingAliases, fact.getState()));
-                    }
-                }
-            }
-            out.removeAll(factsToRemove);
-            out.addAll(factsToAdd);
-
-            // GEN Logic: 'leftOp' gets a new value.
-            if (rightOp instanceof JNewExpr) {
-                JNewExpr newExpr = (JNewExpr) rightOp;
-                if (newExpr.getType().toString().equals("target.exercise2.File")) {
-                    // New File() created. State: Init, Alias: {leftOp}
-                    Set<Value> aliases = newAliasSet();
-                    aliases.add(leftOp);
-                    out.add(new FileStateFact(aliases, FileStateFact.FileState.Init));
-                }
-            } else {
-                // Aliasing: leftOp = rightOp
-                Set<FileStateFact> factsToUpdate = new HashSet<>();
-                Set<FileStateFact> factsToDelete = new HashSet<>();
-
-                for (FileStateFact fact : out) {
-                    if (fact.containsAlias(rightOp)) {
-                        factsToDelete.add(fact);
-
-                        // Collect existing aliases and add the new one (leftOp)
-                        Set<Value> aliasesToOrder = newAliasSet();
-                        for (Value v : allPossibleValues) {
-                            if (fact.containsAlias(v)) {
-                                aliasesToOrder.add(v);
-                            }
-                        }
-                        aliasesToOrder.add(leftOp);
-
-                        // ORDERING FIX: Build the LinkedHashSet in the required order
-                        Set<Value> currentAliases = buildOrderedFactAliases(aliasesToOrder);
-
-                        factsToUpdate.add(new FileStateFact(currentAliases, fact.getState()));
-                    }
-                }
-                out.removeAll(factsToDelete);
-                out.addAll(factsToUpdate);
-            }
-        }
-
-        // --- 2. Handle Method Calls (State Transitions) ---
-        if (stmt instanceof JInvokeStmt) {
-            JInvokeStmt invokeStmt = (JInvokeStmt) stmt;
-            AbstractInvokeExpr invokeExpr = invokeStmt.getInvokeExpr();
-
-            if (invokeExpr.getMethodSignature().getDeclClassType().toString().equals("target.exercise2.File")) {
-                String methodName = invokeExpr.getMethodSignature().getName();
-
-                Value base = null;
-                if (invokeExpr instanceof JVirtualInvokeExpr) {
-                    base = ((JVirtualInvokeExpr) invokeExpr).getBase();
-                } else if (invokeExpr instanceof JSpecialInvokeExpr) {
-                    base = ((JSpecialInvokeExpr) invokeExpr).getBase();
-                } else if (invokeExpr instanceof JInterfaceInvokeExpr) {
-                    base = ((JInterfaceInvokeExpr) invokeExpr).getBase();
-                }
-
-                if (base != null) {
-                    Set<FileStateFact> factsToRemove = new HashSet<>();
-                    Set<FileStateFact> factsToAdd = new HashSet<>();
-
-                    for (FileStateFact fact : out) {
-                        if (fact.containsAlias(base)) {
-                            factsToRemove.add(fact);
-
-                            // Reconstruct aliases
-                            Set<Value> aliasesToOrder = newAliasSet();
-                            for (Value v : allPossibleValues) {
-                                if (fact.containsAlias(v)) {
-                                    aliasesToOrder.add(v);
-                                }
-                            }
-
-                            // ORDERING FIX: Build the LinkedHashSet in the required order
-                            Set<Value> aliases = buildOrderedFactAliases(aliasesToOrder);
-
-                            FileStateFact.FileState newState = fact.getState();
-                            if (methodName.equals("open")) {
-                                newState = FileStateFact.FileState.Open;
-                            } else if (methodName.equals("close")) {
-                                newState = FileStateFact.FileState.Close;
-                            }
-
-                            factsToAdd.add(new FileStateFact(aliases, newState));
-                        }
-                    }
-                    out.removeAll(factsToRemove);
-                    out.addAll(factsToAdd);
-                }
-            }
-        }
-
-        // --- 3. Vulnerability Check at Return ---
-        if (stmt instanceof JReturnStmt || stmt instanceof JReturnVoidStmt) {
-            for (FileStateFact fact : out) {
-                if (fact.getState() == FileStateFact.FileState.Open) {
-                    reporter.reportVulnerability(method.getSignature(), stmt);
-                }
-            }
-        }
-
-        prettyPrint(in, stmt, out);
-        
-    }
 
     @Nonnull
     @Override
     protected Set<FileStateFact> newInitialFlow() {
-        // TODO: Implement your initialization here.
-        // The following line may be just a place holder, check for yourself if
-        // it needs some adjustments.
         return new HashSet<>();
     }
 
     @Override
     protected void copy(@Nonnull Set<FileStateFact> source, @Nonnull Set<FileStateFact> dest) {
-        // TODO: Implement the copy function here.
         dest.clear();
-        for (FileStateFact fsf : source) {
-            dest.add(new FileStateFact(fsf));
+        for (FileStateFact f : source) {
+            dest.add(new FileStateFact(f));
         }
     }
 
     @Override
     protected void merge(@Nonnull Set<FileStateFact> in1, @Nonnull Set<FileStateFact> in2, @Nonnull Set<FileStateFact> out) {
-        // TODO: Implement the merge function here.
-        out.addAll(in1);
-        out.addAll(in2);
+        out.clear();
+        for (FileStateFact f : in1) {
+            out.add(new FileStateFact(f));
+        }
+        for (FileStateFact f : in2) {
+            out.add(new FileStateFact(f));
+        }
     }
-
 }
