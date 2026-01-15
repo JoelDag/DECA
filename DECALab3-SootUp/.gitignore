@@ -1,0 +1,6 @@
+/target/
+src/test/resources/target/
+.classpath
+.project
+.settings
+*.md
