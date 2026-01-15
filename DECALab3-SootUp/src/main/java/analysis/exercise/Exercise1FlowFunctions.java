@@ -31,7 +31,17 @@ public class Exercise1FlowFunctions extends TaintAnalysisFlowFunctions {
             prettyPrint(callSite, fact);
             Set<DataFlowFact> out = Sets.newHashSet();
 
-            //TODO: Implement Exercise 1c) here
+            if (!callee.hasBody() || callSite.getInvokeExpr() == null) {
+                return out;
+            }
+
+            for (int i = 0; i < callSite.getInvokeExpr().getArgCount(); i++) {
+                Value arg = callSite.getInvokeExpr().getArg(i);
+                if (fact.getVariable().equals(arg)) {
+                    Local paramLocal = callee.getBody().getParameterLocal(i);
+                    out.add(new DataFlowFact(paramLocal));
+                }
+            }
 
             return out;
         };
@@ -46,7 +56,14 @@ public class Exercise1FlowFunctions extends TaintAnalysisFlowFunctions {
 
             if (val.equals(DataFlowFact.getZeroInstance())) {
 
-                //TODO: Implement Exercise 1a) here
+                if (call instanceof JAssignStmt
+                        && call.getInvokeExpr() != null
+                        && "getParameter".equals(call.getInvokeExpr().getMethodSignature().getName())) {
+                    Value leftOp = ((JAssignStmt) call).getLeftOp();
+                    if (leftOp instanceof Local) {
+                        out.add(new DataFlowFact((Local) leftOp));
+                    }
+                }
 
             }
             if (call.toString().contains("executeQuery")) {
@@ -85,7 +102,13 @@ public class Exercise1FlowFunctions extends TaintAnalysisFlowFunctions {
             Set<DataFlowFact> out = Sets.newHashSet();
             out.add(fact);
 
-            //TODO: Implement Exercise 1b) here
+            if (curr instanceof JAssignStmt) {
+                Value leftOp = ((JAssignStmt) curr).getLeftOp();
+                Value rightOp = ((JAssignStmt) curr).getRightOp();
+                if (leftOp instanceof Local && rightOp instanceof Local && fact.getVariable().equals(rightOp)) {
+                    out.add(new DataFlowFact((Local) leftOp));
+                }
+            }
 
             return out;
         };
